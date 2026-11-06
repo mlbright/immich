@@ -1,0 +1,46 @@
+[package]
+name = "immich-ml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+autobins = false
+
+[lib]
+name = "immich_ml"
+path = "src/lib.rs"
+
+[[bin]]
+name = "immich-ml"
+path = "src/__main__.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "multipart", "query"] }
+futures = "0.3"
+half = "2"
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
+jpegxl-rs = { version = "=0.15.0", default-features = false, features = ["vendored"] }
+libc = "0.2"
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
+mimalloc = { version = "0.1.52", default-features = false, features = ["override"] }
+nalgebra = "0.35"
+ndarray = "0.17"
+opencv = { version = "0.101", default-features = false, features = ["imgproc"] }
+ort = { version = "=2.0.0-rc.15", features = ["half", "ndarray"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+turbojpeg = { version = "1.5", default-features = false, features = ["cmake"] }
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart"] }

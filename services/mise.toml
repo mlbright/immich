@@ -1,0 +1,33 @@
+[tools]
+rust = { version = "1.99.1", components = "rustfmt,clippy" }
+cmake = "4.2.0"
+
+[env]
+OPENCV_INCLUDE_PATHS = "{% if os() == 'macos' %}/opt/homebrew/opt/opencv@4/include/opencv4{% endif %}"
+OPENCV_LINK_PATHS = "{% if os() == 'macos' %}/opt/homebrew/opt/opencv@4/lib{% endif %}"
+OPENCV_LINK_LIBS = "{% if os() == 'macos' %}opencv_core,opencv_imgproc{% endif %}"
+LIBCLANG_PATH = "{% if os() == 'macos' %}/opt/homebrew/opt/llvm/lib{% endif %}"
+
+[tasks.build]
+description = "Build the Rust services"
+run = "cargo build --workspace --release"
+
+[tasks.test]
+description = "Run the Rust tests"
+run = "cargo test --workspace --locked"
+
+[tasks.fmt]
+description = "Check Rust formatting"
+run = "cargo fmt --all --check"
+
+[tasks."fmt-fix"]
+description = "Format Rust code"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Run clippy with warnings as errors"
+run = "cargo clippy --workspace --all-targets --locked -- -D warnings"
+
+[tasks.ml-differential]
+description = "Compare a running Rust ML service with a running Python ML service"
+run = "cargo test --release --package immich-ml --test differential -- --ignored --nocapture"
