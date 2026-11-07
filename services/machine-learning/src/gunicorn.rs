@@ -14,6 +14,10 @@ pub const WORKER_BOOT_ERROR: u8 = 3;
 pub const LISTENER_FD: &str = "IMMICH_ML_LISTENER_FD";
 pub const HEARTBEAT: &str = "IMMICH_ML_HEARTBEAT";
 
+pub fn forwarded_allow_ips() -> String {
+    std::env::var("FORWARDED_ALLOW_IPS").unwrap_or_else(|_| "127.0.0.1,::1".to_owned())
+}
+
 pub struct Config {
     pub workers: usize,
     pub timeout: Duration,

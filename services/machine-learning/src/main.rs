@@ -1,25 +1,28 @@
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::Router;
-use axum::extract::{DefaultBodyLimit, Multipart, State};
+use axum::body::Body;
+use axum::extract::{Multipart, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared, join_all};
+use hyper::Request;
+use hyper::body::Incoming;
+use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
-use hyper_util::service::TowerToHyperService;
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::AbortHandle;
 use tracing::{error, info, warn};
 
 use crate::allocator;
 use crate::config::{PreloadModelData, settings};
-use crate::gunicorn::WorkerTmp;
+use crate::fastapi::{FastApi, detail, json_response};
+use crate::gunicorn::{self, WorkerTmp};
 use crate::models::base::{AnyModel, InferenceEntry, Input, MlError};
 use crate::models::cache::ModelCache;
 use crate::models::transforms::decode_pil;
@@ -29,6 +32,7 @@ use crate::schemas::{
     Output, TextDetectionOptions, TextRecognitionOptions, TextualOptions, VisualOptions,
     identity_repr,
 };
+use crate::uvicorn::{Scope, TrustedHosts};
 
 #[derive(Default)]
 struct RequestState {
@@ -239,23 +243,6 @@ fn get_entries(entries: &str) -> Result<Vec<InferenceEntry>, MlError> {
     Ok(found)
 }
 
-fn detail(status: u16, detail: &str) -> Response {
-    let body = serde_json::json!({ "detail": detail }).to_string();
-    json_response(
-        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        body,
-    )
-}
-
-fn json_response(status: StatusCode, body: String) -> Response {
-    let mut response = (status, body).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    response
-}
-
 fn error_response(error: &MlError) -> Response {
     match error {
         MlError::Http {
@@ -280,14 +267,11 @@ fn missing_entries() -> Response {
     json_response(StatusCode::UNPROCESSABLE_ENTITY, body.to_owned())
 }
 
-pub fn router(app: Arc<App>) -> Router {
-    Router::new()
-        .route("/", get(root))
-        .route("/ping", get(ping))
-        .route("/predict", post(predict))
-        .method_not_allowed_fallback(|| async { detail(405, "Method Not Allowed") })
-        .fallback(|| async { detail(404, "Not Found") })
-        .layer(DefaultBodyLimit::disable())
+pub fn router(app: Arc<App>) -> FastApi {
+    FastApi::new()
+        .get("/", root)
+        .get("/ping", ping)
+        .post("/predict", predict)
         .with_state(app)
 }
 
@@ -596,15 +580,19 @@ pub async fn work(
     } else {
         http.keep_alive(false);
     }
+    let trusted_hosts = Arc::new(TrustedHosts::parse(&gunicorn::forwarded_allow_ips())?);
     let graceful = GracefulShutdown::new();
-    let service = TowerToHyperService::new(router(app.clone()));
+    let fastapi = router(app.clone());
     let shutdown = shutdown_signal(&app);
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let stream = match accepted {
-                    Ok((stream, _)) => stream,
+                let (stream, client, server) = match accepted.and_then(|(stream, client)| {
+                    let server = stream.local_addr()?;
+                    Ok((stream, client, server))
+                }) {
+                    Ok(accepted) => accepted,
                     Err(error) => {
                         error!("{error}");
                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -612,7 +600,13 @@ pub async fn work(
                     }
                 };
                 let _ = stream.set_nodelay(true);
-                let connection = graceful.watch(http.serve_connection(TokioIo::new(stream), service.clone()));
+                let fastapi = fastapi.clone();
+                let trusted_hosts = trusted_hosts.clone();
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let scope = Scope::new(&request, server, client, &trusted_hosts);
+                    fastapi.clone().call(request.map(Body::new), scope).map(Ok::<_, Infallible>)
+                });
+                let connection = graceful.watch(http.serve_connection(TokioIo::new(stream), service));
                 tokio::spawn(connection);
             }
             _ = &mut shutdown => break,

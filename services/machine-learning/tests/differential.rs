@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 
+use reqwest::Method;
 use reqwest::multipart::{Form, Part};
 use serde_json::{Value, json};
 
 const NEAR_TIE_FLIPS_PER_IMAGE: usize = 1;
 
 type FormFactory = Box<dyn Fn() -> Form>;
+type Header = Option<(&'static str, &'static str)>;
 
 struct Target {
     reference: String,
@@ -15,7 +17,33 @@ struct Target {
 
 struct Reply {
     status: u16,
+    headers: Vec<(String, String)>,
     body: String,
+}
+
+async fn reply(response: reqwest::Response, base: &str, names: &[&str]) -> Reply {
+    let authority = base
+        .split_once("://")
+        .map_or(base, |(_, authority)| authority);
+    let headers = names
+        .iter()
+        .filter_map(|name| {
+            let value = response.headers().get(*name)?.to_str().ok()?;
+            let value = if *name == "allow" {
+                let mut methods: Vec<&str> = value.split(", ").collect();
+                methods.sort_unstable();
+                methods.join(", ")
+            } else {
+                value.replace(authority, "{base}")
+            };
+            Some(((*name).to_owned(), value))
+        })
+        .collect();
+    Reply {
+        status: response.status().as_u16(),
+        headers,
+        body: response.text().await.expect("body"),
+    }
 }
 
 impl Target {
@@ -25,6 +53,7 @@ impl Target {
             candidate: std::env::var("IMMICH_ML_CANDIDATE_URL").ok()?,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(600))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .ok()?,
         })
@@ -38,10 +67,21 @@ impl Target {
             .send()
             .await
             .expect("request");
-        Reply {
-            status: response.status().as_u16(),
-            body: response.text().await.expect("body"),
+        reply(response, base, &["content-type"]).await
+    }
+
+    async fn request(&self, base: &str, method: &Method, path: &str, header: Header) -> Reply {
+        let mut request = self.client.request(method.clone(), format!("{base}{path}"));
+        if let Some((name, value)) = header {
+            request = request.header(name, value);
         }
+        let response = request.send().await.expect("request");
+        reply(
+            response,
+            base,
+            &["allow", "content-length", "content-type", "location"],
+        )
+        .await
     }
 
     async fn both(&self, form: impl Fn() -> Form) -> (Reply, Reply) {
@@ -77,11 +117,21 @@ impl Report {
         compare: impl FnOnce(&Value, &Value, &mut Findings),
     ) {
         self.checks += 1;
-        if reference.status == candidate.status && reference.body == candidate.body {
+        if reference.status == candidate.status
+            && reference.headers == candidate.headers
+            && reference.body == candidate.body
+        {
             self.identical += 1;
             return;
         }
         self.differing.push(label.to_owned());
+        if reference.headers != candidate.headers {
+            self.failures.push(format!(
+                "{label}: headers differ\n  reference: {:?}\n  candidate: {:?}",
+                reference.headers, candidate.headers
+            ));
+            return;
+        }
         if reference.status != candidate.status {
             self.failures.push(format!(
                 "{label}: status {} vs {}\n  reference: {}\n  candidate: {}",
@@ -518,28 +568,38 @@ async fn rust_matches_python() {
         report.record(label, &reference, &candidate, exact);
     }
 
-    for path in ["/", "/ping", "/missing"] {
+    let requests: [(Method, &str, Header); 18] = [
+        (Method::GET, "/", None),
+        (Method::GET, "/ping", None),
+        (Method::GET, "/missing", None),
+        (Method::GET, "/openapi.json", None),
+        (Method::GET, "/docs", None),
+        (Method::GET, "/docs/oauth2-redirect", None),
+        (Method::GET, "/redoc", None),
+        (Method::HEAD, "/openapi.json", None),
+        (Method::HEAD, "/ping", None),
+        (Method::POST, "/ping", None),
+        (Method::DELETE, "/docs", None),
+        (Method::GET, "/ping/", None),
+        (Method::POST, "/predict/", None),
+        (Method::HEAD, "/docs/", None),
+        (Method::GET, "/p%69ng", None),
+        (Method::GET, "/ping%2F?a=1&b=%20x", None),
+        (Method::GET, "/docs/", Some(("x-forwarded-proto", "https"))),
+        (Method::GET, "/docs/", Some(("host", "example.com:8080"))),
+    ];
+    for (method, path, header) in requests {
         let reference = target
-            .client
-            .get(format!("{}{path}", target.reference))
-            .send()
-            .await
-            .expect("request");
+            .request(&target.reference, &method, path, header)
+            .await;
         let candidate = target
-            .client
-            .get(format!("{}{path}", target.candidate))
-            .send()
-            .await
-            .expect("request");
-        let reference = Reply {
-            status: reference.status().as_u16(),
-            body: reference.text().await.expect("body"),
+            .request(&target.candidate, &method, path, header)
+            .await;
+        let label = match header {
+            Some((name, value)) => format!("{method} {path} {name}: {value}"),
+            None => format!("{method} {path}"),
         };
-        let candidate = Reply {
-            status: candidate.status().as_u16(),
-            body: candidate.text().await.expect("body"),
-        };
-        report.record(&format!("GET {path}"), &reference, &candidate, exact);
+        report.record(&label, &reference, &candidate, exact);
     }
 
     report

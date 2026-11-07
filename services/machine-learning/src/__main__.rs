@@ -10,6 +10,7 @@ use immich_ml::gunicorn::{self, Config, HEARTBEAT, LISTENER_FD, WORKER_BOOT_ERRO
 use immich_ml::main::{WorkerExit, work};
 use immich_ml::sessions::ort::flush_denormals;
 use immich_ml::sessions::prepare;
+use immich_ml::uvicorn::TrustedHosts;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -48,6 +49,7 @@ fn main() -> anyhow::Result<ExitCode> {
         _ => info!("Initializing Immich ML"),
     }
     let settings = settings();
+    TrustedHosts::parse(&gunicorn::forwarded_allow_ips())?;
     let host = bind_host(&non_prefixed.immich_host);
     let listener =
         TcpListener::bind((host.as_str(), non_prefixed.immich_port)).with_context(|| {
