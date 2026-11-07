@@ -1130,6 +1130,8 @@ dependencies = [
  "axum",
  "futures",
  "half",
+ "hyper",
+ "hyper-util",
  "image",
  "jpegxl-rs",
  "libc",

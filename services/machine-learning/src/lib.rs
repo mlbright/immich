@@ -2,6 +2,7 @@
 
 pub mod allocator;
 pub mod config;
+pub mod gunicorn;
 pub mod huggingface_hub;
 pub mod immich_model;
 pub mod main;

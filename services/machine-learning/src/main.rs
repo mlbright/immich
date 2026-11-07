@@ -10,12 +10,16 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared, join_all};
-use tokio::sync::Semaphore;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::server::graceful::GracefulShutdown;
+use hyper_util::service::TowerToHyperService;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::AbortHandle;
 use tracing::{error, info, warn};
 
 use crate::allocator;
 use crate::config::{PreloadModelData, settings};
+use crate::gunicorn::WorkerTmp;
 use crate::models::base::{AnyModel, InferenceEntry, Input, MlError};
 use crate::models::cache::ModelCache;
 use crate::models::transforms::decode_pil;
@@ -37,6 +41,7 @@ pub struct App {
     thread_pool: Option<Arc<Semaphore>>,
     active_requests: AtomicUsize,
     state: Mutex<RequestState>,
+    shutdown: Notify,
 }
 
 type Run = Shared<BoxFuture<'static, Result<Arc<Output>, Arc<MlError>>>>;
@@ -51,6 +56,7 @@ impl App {
             thread_pool,
             active_requests: AtomicUsize::new(0),
             state: Mutex::new(RequestState::default()),
+            shutdown: Notify::new(),
         })
     }
 
@@ -534,37 +540,88 @@ async fn idle_shutdown_task(app: Arc<App>) {
             })
         };
         if idle {
-            info!("Unloading models due to inactivity.");
-            app.model_cache.clear_expiring();
-            app.state.lock().expect("request state lock").last_called = None;
+            info!("Shutting down due to inactivity.");
+            app.shutdown.notify_one();
+            break;
         }
         tokio::time::sleep(Duration::from_secs(settings.model_ttl_poll_s as u64)).await;
     }
 }
 
-pub async fn serve(listener: tokio::net::TcpListener) -> anyhow::Result<()> {
+async fn shutdown_signal(app: &App) {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("signal handler");
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("signal handler");
+    tokio::select! {
+        _ = terminate.recv() => {}
+        _ = interrupt.recv() => {}
+        _ = app.shutdown.notified() => {}
+    }
+}
+
+async fn heartbeat(tmp: WorkerTmp) {
+    loop {
+        tmp.notify();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+pub enum WorkerExit {
+    Finished,
+    BootError,
+}
+
+pub async fn work(
+    listener: tokio::net::TcpListener,
+    tmp: Option<WorkerTmp>,
+) -> anyhow::Result<WorkerExit> {
+    if let Some(tmp) = tmp {
+        tokio::spawn(heartbeat(tmp));
+    }
+    info!("Started server process [{}]", std::process::id());
     let app = App::new();
-    lifespan(&app).await?;
-    let cache = app.model_cache.clone();
-    axum::serve(listener, router(app))
-        .with_graceful_shutdown(async {
-            let interrupt = tokio::signal::ctrl_c();
-            #[cfg(unix)]
-            {
-                let mut terminate =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("signal handler");
-                tokio::select! {
-                    _ = interrupt => {}
-                    _ = terminate.recv() => {}
-                }
+    if let Err(error) = lifespan(&app).await {
+        error!("{error:#}");
+        error!("Application startup failed. Exiting.");
+        return Ok(WorkerExit::BootError);
+    }
+    info!("Application startup complete.");
+    let keepalive = settings().http_keepalive_timeout_s;
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(TokioTimer::new());
+    if keepalive > 0 {
+        http.keep_alive(true)
+            .header_read_timeout(Duration::from_secs(keepalive as u64));
+    } else {
+        http.keep_alive(false);
+    }
+    let graceful = GracefulShutdown::new();
+    let service = TowerToHyperService::new(router(app.clone()));
+    let shutdown = shutdown_signal(&app);
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(error) => {
+                        error!("{error}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                let _ = stream.set_nodelay(true);
+                let connection = graceful.watch(http.serve_connection(TokioIo::new(stream), service.clone()));
+                tokio::spawn(connection);
             }
-            #[cfg(not(unix))]
-            {
-                let _ = interrupt.await;
-            }
-        })
-        .await?;
-    cache.clear();
-    Ok(())
+            _ = &mut shutdown => break,
+        }
+    }
+    drop(listener);
+    info!("Shutting down");
+    graceful.shutdown().await;
+    app.model_cache.clear();
+    info!("Finished server process [{}]", std::process::id());
+    Ok(WorkerExit::Finished)
 }

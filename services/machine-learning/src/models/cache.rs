@@ -80,19 +80,6 @@ impl ModelCache {
         allocator::release();
     }
 
-    pub fn clear_expiring(&self) {
-        let mut inner = self.inner.lock().expect("model cache lock");
-        let expiring: Vec<Key> = inner.expiries.keys().cloned().collect();
-        for key in expiring {
-            inner.models.remove(&key);
-            if let Some(expiry) = inner.expiries.remove(&key) {
-                expiry.handle.abort();
-            }
-        }
-        drop(inner);
-        allocator::release();
-    }
-
     fn evict(&self, key: &Key, generation: u64) {
         let mut inner = self.inner.lock().expect("model cache lock");
         if !inner.models.contains_key(key)
